@@ -18,24 +18,30 @@ import discord
 from discord.ext import commands, tasks
 
 # ==================== 0. HEALTH CHECK СЕРВЕР (для Render Web Service) ====================
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/health':
+        if self.path == '/health' or self.path == '/':
             self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b'OK')
+            self.wfile.write("✅ Бот работает\n".encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Не засоряем логи запросами к /health
+        pass  # Не засоряем логи
 
 def start_health_server():
-    """Запускаем минимальный веб-сервер для здоровья на порту 8000"""
+    """Запускаем сервер на порту из переменной окружения PORT (обязательно для Render)"""
+    port = int(os.environ.get("PORT", "8000"))  # 🔑 Render сам устанавливает PORT
     try:
-        server = HTTPServer(('0.0.0.0', 8000), HealthCheckHandler)
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        logger.info(f"✅ Health server запущен на порту {port} (Render PORT={port})")
         server.serve_forever()
     except Exception as e:
         logger.error(f"❌ Ошибка запуска health server: {e}")
