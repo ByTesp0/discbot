@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord бот для автоматического снятия роли через 24 часа после выдачи
+Работает как Web Service на Render с health check endpoint
 """
 
 import os
@@ -11,14 +12,39 @@ import logging.handlers
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import sqlite3
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands, tasks
+
+# ==================== 0. HEALTH CHECK СЕРВЕР (для Render Web Service) ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # Не засоряем логи запросами к /health
+
+def start_health_server():
+    """Запускаем минимальный веб-сервер для здоровья на порту 8000"""
+    try:
+        server = HTTPServer(('0.0.0.0', 8000), HealthCheckHandler)
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска health server: {e}")
 
 # ==================== 1. НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 Path("logs").mkdir(exist_ok=True)
 
 logger = logging.getLogger("role_manager_bot")
-logger.setLevel(logging.DEBUG)  # DEBUG для детального логирования при отладке
+logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter(
     '%(asctime)s | %(levelname)-8s | %(message)s',
@@ -52,7 +78,7 @@ if ROLE_ID_TO_TRACK == 0:
     logger.error("❌ Не указан ROLE_ID в переменных окружения! Остановка бота.")
     sys.exit(1)
 
-# ==================== 3. БАЗА ДАННЫХ ====================
+# ==================== 3. БАЗА ДАННЫХ С МИГРАЦИЕЙ ====================
 class Database:
     def __init__(self, path="roles.db"):
         self.path = path
@@ -62,16 +88,32 @@ class Database:
         try:
             conn = sqlite3.connect(self.path)
             cursor = conn.cursor()
+            
+            # Создаём таблицу если не существует
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS pending_roles (
                     user_id INTEGER NOT NULL,
                     guild_id INTEGER NOT NULL,
                     role_id INTEGER NOT NULL,
                     assigned_at TEXT NOT NULL,
-                    assigned_by TEXT NOT NULL,
+                    assigned_by TEXT NOT NULL DEFAULT 'unknown',
                     PRIMARY KEY (user_id, guild_id, role_id)
                 )
             """)
+            
+            # === МИГРАЦИЯ: добавляем колонку assigned_by если её нет ===
+            # Проверяем структуру таблицы
+            cursor.execute("PRAGMA table_info(pending_roles)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'assigned_by' not in columns:
+                logger.info("🔧 Обнаружена старая структура БД — запускаем миграцию...")
+                # Добавляем колонку с временным значением по умолчанию
+                cursor.execute("ALTER TABLE pending_roles ADD COLUMN assigned_by TEXT NOT NULL DEFAULT 'migrated'")
+                logger.info("✅ Колонка assigned_by успешно добавлена через миграцию")
+            else:
+                logger.debug("ℹ️  Колонка assigned_by уже существует в БД")
+            
             conn.commit()
             conn.close()
             logger.info(f"✅ База данных инициализирована: {self.path}")
@@ -262,7 +304,6 @@ class RoleManagerCog(commands.Cog):
                 except discord.Forbidden as e:
                     errors += 1
                     logger.error(f"❌ Нет прав для снятия роли у {user_id} на сервере {guild_id}: {e}")
-                    # Не удаляем запись — возможно, права появятся позже
                 except Exception as e:
                     errors += 1
                     logger.exception(f"❌ Ошибка при обработке записи (user={user_id}, guild={guild_id}): {e}")
@@ -295,7 +336,6 @@ class RoleManagerCog(commands.Cog):
         
         if oldest and count > 0:
             try:
-                # Надёжный парсинг даты с обработкой разных форматов
                 clean_date = oldest.replace("Z", "+00:00") if "Z" in oldest else oldest
                 assigned_dt = datetime.fromisoformat(clean_date)
                 delta = datetime.now(timezone.utc) - assigned_dt
@@ -343,6 +383,11 @@ def main():
     logger.info("🚀 Инициализация базы данных...")
     db = Database()
     
+    # Запускаем health check сервер ДО бота (в отдельном потоке)
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    logger.info("✅ Health check сервер запущен на порту 8000 (/health)")
+    
     intents = discord.Intents.default()
     intents.members = True
     intents.message_content = True
@@ -361,7 +406,7 @@ def main():
         elif isinstance(error, commands.CommandNotFound):
             pass
         else:
-            logger.exception(f"Ошибка команды: {error}")
+            logger.exception(f"Ошибка команды: {e}")
             await ctx.send("❌ Произошла внутренняя ошибка при выполнении команды")
     
     @bot.command()
